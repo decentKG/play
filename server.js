@@ -94,35 +94,69 @@ app.get('/stream/:videoId', async (req, res) => {
             return res.status(400).send('Invalid video ID');
         }
 
+        // Set headers for video streaming
+        res.setHeader('Content-Type', 'video/mp4');
+        res.setHeader('Accept-Ranges', 'bytes');
+        res.setHeader('Cache-Control', 'no-cache');
+        
+        // Handle range requests for video seeking
         const range = req.headers.range;
         
         if (range) {
-            const info = await ytdl.getInfo(url);
-            const format = ytdl.chooseFormat(info.formats, { quality: quality });
-            
-            res.setHeader('Content-Type', 'video/mp4');
-            res.setHeader('Accept-Ranges', 'bytes');
-            
-            const videoStream = ytdl(url, { 
-                quality: quality,
-                range: range 
-            });
-            
-            videoStream.pipe(res);
-            
-            videoStream.on('error', (err) => {
-                console.error('Stream error:', err);
-                res.status(500).end();
-            });
-        } else {
-            res.setHeader('Content-Type', 'video/mp4');
-            const videoStream = ytdl(url, { quality: quality });
-            videoStream.pipe(res);
+            try {
+                const info = await ytdl.getInfo(url);
+                const format = ytdl.chooseFormat(info.formats, { 
+                    quality: quality === 'highest' ? 'highestvideo' : quality,
+                    filter: 'videoandaudio'
+                });
+                
+                if (format && format.contentLength) {
+                    const total = parseInt(format.contentLength);
+                    const parts = range.replace(/bytes=/, "").split("-");
+                    const start = parseInt(parts[0], 10);
+                    const end = parts[1] ? parseInt(parts[1], 10) : total - 1;
+                    const chunksize = (end - start) + 1;
+                    
+                    res.writeHead(206, {
+                        'Content-Range': `bytes ${start}-${end}/${total}`,
+                        'Accept-Ranges': 'bytes',
+                        'Content-Length': chunksize,
+                        'Content-Type': 'video/mp4',
+                    });
+                    
+                    const videoStream = ytdl(url, { 
+                        quality: quality,
+                        range: { start, end }
+                    });
+                    
+                    videoStream.pipe(res);
+                    return;
+                }
+            } catch (rangeError) {
+                console.log('Range request failed, falling back to regular stream');
+            }
         }
+        
+        // Regular streaming without range
+        const videoStream = ytdl(url, { 
+            quality: quality === 'highest' ? 'highestvideo' : quality,
+            filter: 'videoandaudio'
+        });
+        
+        videoStream.on('error', (err) => {
+            console.error('Stream error:', err);
+            if (!res.headersSent) {
+                res.status(500).send('Streaming failed');
+            }
+        });
+        
+        videoStream.pipe(res);
         
     } catch (error) {
         console.error('Streaming error:', error);
-        res.status(500).send('Streaming failed');
+        if (!res.headersSent) {
+            res.status(500).send('Streaming failed');
+        }
     }
 });
 
@@ -275,25 +309,6 @@ app.get('/download-progress/:downloadId', (req, res) => {
     });
 });
 
-// Check completed downloads (legacy endpoint)
-app.get('/check-completed', (req, res) => {
-    // Return the first completed download
-    for (let [id, download] of completedDownloads.entries()) {
-        if (download.completed && !download.sent) {
-            download.sent = true;
-            return res.json({
-                status: 'finished',
-                filename: download.filename,
-                path: `/download/${download.filename}`
-            });
-        }
-    }
-    
-    res.json({
-        status: 'pending'
-    });
-});
-
 // Serve download files
 app.get('/download/:filename', (req, res) => {
     const filename = req.params.filename;
@@ -364,7 +379,8 @@ async function startDownload(url, format, info) {
         progress: 0,
         completed: false,
         error: null,
-        filePath: filePath
+        filePath: filePath,
+        timestamp: Date.now()
     };
     
     activeDownloads.set(videoId, downloadInfo);
@@ -380,6 +396,7 @@ async function startDownload(url, format, info) {
         
         stream.on('response', (response) => {
             totalBytes = parseInt(response.headers['content-length']) || 0;
+            console.log(`Total size: ${totalBytes} bytes`);
         });
         
         stream.on('data', (chunk) => {
@@ -387,6 +404,7 @@ async function startDownload(url, format, info) {
             if (totalBytes > 0) {
                 const progress = Math.round((downloadedBytes / totalBytes) * 100);
                 downloadInfo.progress = progress;
+                console.log(`Progress: ${progress}%`);
             }
         });
         
@@ -412,12 +430,22 @@ async function startDownload(url, format, info) {
             console.error('Write stream error:', error);
             downloadInfo.error = error.message;
             activeDownloads.delete(videoId);
+            
+            // Clean up partial file
+            if (fs.existsSync(filePath)) {
+                fs.unlinkSync(filePath);
+            }
         });
         
         stream.on('error', (error) => {
             console.error('Download stream error:', error);
             downloadInfo.error = error.message;
             activeDownloads.delete(videoId);
+            
+            // Clean up partial file
+            if (fs.existsSync(filePath)) {
+                fs.unlinkSync(filePath);
+            }
         });
         
     } catch (error) {
@@ -438,7 +466,12 @@ setInterval(() => {
         if (now - download.timestamp > maxAge) {
             // Delete file and remove from memory
             if (fs.existsSync(download.filePath)) {
-                fs.unlinkSync(download.filePath);
+                try {
+                    fs.unlinkSync(download.filePath);
+                    console.log(`Cleaned up old download: ${download.filename}`);
+                } catch (error) {
+                    console.error('Error cleaning up file:', error);
+                }
             }
             completedDownloads.delete(id);
         }
